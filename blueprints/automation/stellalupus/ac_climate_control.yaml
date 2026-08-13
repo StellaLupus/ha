@@ -1,0 +1,255 @@
+blueprint:
+  name: "Кондиционер: климат-контроль (cool/dry/fan_only)"
+  description: >
+    Автоматически выбирает режим кондиционера (cool/dry/fan_only) по внешнему
+    датчику температуры/влажности, затем — если целевой режим И текущее
+    (живое) состояние кондиционера оба cool или dry — корректирует уставку
+    под реальную температуру (offset = температура_кондиционера -
+    температура_внешнего_датчика).
+
+    Смена режима и коррекция уставки разнесены паузой в 2 секунды, чтобы не
+    слать в облачный API кондиционера (например, Haier) два запроса
+    одновременно. Смена режима дополнительно защищена минимальным интервалом
+    между переключениями (защита компрессора от частых стартов/стопов).
+    Коррекция уставки шлётся только когда сдвиг не меньше гистерезиса
+    температуры — чтобы не спамить кондиционер командами.
+
+    Если датчик влажности недоступен или его значение вне диапазона 0–100,
+    это блокирует только выбор режима dry (осушение), но не блокирует выбор
+    cool/fan_only по температуре и коррекцию уставки в целом — датчики
+    качества воздуха (Qingping и подобные) регулярно уходят в offline.
+
+    Приоритет режимов: охлаждение (cool) > осушение (dry) > вентиляция
+    (fan_only).
+
+    Автоматика никогда сама не включает и не выключает кондиционер из
+    состояния off — только меняет режим/уставку, пока он уже включён (в т.ч.
+    включён вручную — есть отдельный триггер на выход из off).
+
+    Тумблер (input_boolean) включает/выключает всю автоматику для конкретного
+    кондиционера.
+  domain: automation
+  author: StellaLupus
+  source_url: https://github.com/StellaLupus/ha/blob/main/blueprints/automation/stellalupus/ac_climate_control.yaml
+  homeassistant:
+    min_version: "2024.10.0"
+
+  input:
+    devices:
+      name: Устройства
+      icon: mdi:air-conditioner
+      input:
+        ac_climate:
+          name: Кондиционер
+          description: Climate-сущность кондиционера, которым управляем.
+          selector:
+            entity:
+              domain: climate
+        temp_sensor:
+          name: Датчик температуры
+          description: Внешний датчик температуры в помещении (не встроенный в кондиционер).
+          selector:
+            entity:
+              domain: sensor
+              device_class: temperature
+        humidity_sensor:
+          name: Датчик влажности
+          description: >
+            Внешний датчик влажности в помещении. Если он временно
+            недоступен, режим dry просто не выбирается — остальная логика
+            продолжает работать.
+          selector:
+            entity:
+              domain: sensor
+              device_class: humidity
+
+    helpers:
+      name: Параметры (input_number / input_boolean)
+      icon: mdi:tune
+      description: >
+        Существующие helper-сущности для этого кондиционера. Каждый
+        кондиционер использует свой набор helper'ов, чтобы значения можно
+        было настраивать из UI независимо по комнатам.
+      input:
+        enable_toggle:
+          name: Тумблер автоматики
+          description: input_boolean, включающий/выключающий весь автоматический климат-контроль.
+          selector:
+            entity:
+              domain: input_boolean
+        target_temp_helper:
+          name: Целевая температура
+          selector:
+            entity:
+              domain: input_number
+        temp_hysteresis_helper:
+          name: Гистерезис температуры
+          selector:
+            entity:
+              domain: input_number
+        humidity_threshold_helper:
+          name: Порог влажности для осушения
+          selector:
+            entity:
+              domain: input_number
+        humidity_hysteresis_helper:
+          name: Гистерезис влажности
+          selector:
+            entity:
+              domain: input_number
+        min_interval_helper:
+          name: Мин. интервал смены режима (минуты)
+          description: Защита компрессора — минимальное время между переключениями hvac_mode.
+          selector:
+            entity:
+              domain: input_number
+
+    settings:
+      name: Настройки поведения
+      icon: mdi:cog
+      collapsed: true
+      input:
+        min_valid_temp:
+          name: Минимально допустимая температура датчика
+          description: >
+            Ниже этого значения показания датчика считаются недостоверными
+            (защита от промерзшего/отвалившегося датчика) — автоматика не
+            действует.
+          default: 5
+          selector:
+            number: { min: -20, max: 15, unit_of_measurement: "°C", mode: box }
+        mode_switch_delay:
+          name: Пауза между сменой режима и коррекцией уставки
+          description: Секунды. Не даёт двум командам улететь в облако кондиционера одновременно.
+          default: 2
+          selector:
+            number: { min: 0, max: 10, unit_of_measurement: "сек", mode: box }
+
+variables:
+  ac_climate: !input ac_climate
+  temp_sensor: !input temp_sensor
+  humidity_sensor: !input humidity_sensor
+  enable_toggle: !input enable_toggle
+  target_temp_helper: !input target_temp_helper
+  temp_hysteresis_helper: !input temp_hysteresis_helper
+  humidity_threshold_helper: !input humidity_threshold_helper
+  humidity_hysteresis_helper: !input humidity_hysteresis_helper
+  min_interval_helper: !input min_interval_helper
+  min_valid_temp: !input min_valid_temp
+  mode_switch_delay: !input mode_switch_delay
+  current_mode: "{{ states(ac_climate) }}"
+  t: "{{ states(temp_sensor) | float(0) }}"
+  h: "{{ states(humidity_sensor) | float(0) }}"
+  target: "{{ states(target_temp_helper) | float(24) }}"
+  th: "{{ states(temp_hysteresis_helper) | float(1) }}"
+  hmax: "{{ states(humidity_threshold_helper) | float(60) }}"
+  hh: "{{ states(humidity_hysteresis_helper) | float(5) }}"
+  humidity_valid: >-
+    {{ states(humidity_sensor) not in ['unavailable', 'unknown', 'none', 'None']
+       and 0 < (states(humidity_sensor) | float(-1)) < 100 }}
+  target_mode: "{% if t >= target + th or (current_mode == 'cool' and t > target - th) %}cool{% elif humidity_valid and (h >= hmax + hh or (current_mode == 'dry' and h > hmax - hh)) %}dry{% else %}fan_only{% endif %}"
+  seconds_since_last_change: "{{ (now() - states[ac_climate].last_changed).total_seconds() }}"
+  min_cycle_seconds: "{{ (states(min_interval_helper) | float(5)) * 60 }}"
+
+triggers:
+  - trigger: state
+    entity_id: !input temp_sensor
+    id: temp_updated
+  - trigger: state
+    entity_id: !input humidity_sensor
+    id: humidity_updated
+  - trigger: state
+    entity_id: !input target_temp_helper
+    id: target_temp_changed
+  - trigger: state
+    entity_id: !input temp_hysteresis_helper
+    id: temp_hyst_changed
+  - trigger: state
+    entity_id: !input humidity_threshold_helper
+    id: humidity_max_changed
+  - trigger: state
+    entity_id: !input humidity_hysteresis_helper
+    id: humidity_hyst_changed
+  - trigger: state
+    entity_id: !input min_interval_helper
+    id: min_interval_changed
+  - trigger: state
+    entity_id: !input enable_toggle
+    to: "on"
+    id: auto_control_enabled
+  - trigger: state
+    entity_id: !input ac_climate
+    to: ["cool", "dry"]
+    id: entered_cool_or_dry
+  - trigger: state
+    entity_id: !input ac_climate
+    from: "off"
+    id: manual_power_on
+  - trigger: state
+    entity_id: !input ac_climate
+    attribute: current_temperature
+    id: ac_sensor_updated
+
+conditions:
+  - condition: state
+    entity_id: !input enable_toggle
+    state: "on"
+  - condition: not
+    conditions:
+      - condition: state
+        entity_id: !input ac_climate
+        state: ["unavailable", "unknown", "off"]
+  - condition: numeric_state
+    entity_id: !input temp_sensor
+    above: !input min_valid_temp
+
+mode: restart
+
+actions:
+  - alias: "Меняем режим, если он должен измениться (с защитой от частого переключения компрессора)"
+    choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ target_mode != current_mode }}"
+          - condition: template
+            value_template: "{{ seconds_since_last_change >= min_cycle_seconds }}"
+        sequence:
+          - action: climate.set_hvac_mode
+            target:
+              entity_id: !input ac_climate
+            data:
+              hvac_mode: "{{ target_mode }}"
+          - alias: "Пауза перед возможной коррекцией уставки, чтобы команды не улетели в облако одновременно"
+            delay:
+              seconds: "{{ mode_switch_delay }}"
+
+  - alias: "Коррекция уставки под реальную температуру — только когда целевой режим и ЖИВОЕ состояние кондиционера — cool или dry"
+    choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ target_mode in ['cool', 'dry'] }}"
+          - condition: state
+            entity_id: !input ac_climate
+            state: ["cool", "dry"]
+          - condition: numeric_state
+            entity_id: !input ac_climate
+            attribute: current_temperature
+            above: !input min_valid_temp
+          - condition: numeric_state
+            entity_id: !input ac_climate
+            attribute: temperature
+            above: 0
+        sequence:
+          - variables:
+              offset: "{{ state_attr(ac_climate, 'current_temperature') | float(0) - t }}"
+              raw_setpoint: "{{ target + offset }}"
+              desired_setpoint: "{{ [[raw_setpoint, 16] | max, 30] | min | round(0) }}"
+              current_setpoint: "{{ state_attr(ac_climate, 'temperature') | float(0) }}"
+          - condition: template
+            alias: "Отправляем команду только при изменении не меньше гистерезиса температуры (th), чтобы не спамить кондиционер"
+            value_template: "{{ (desired_setpoint - current_setpoint) | abs >= th }}"
+          - action: climate.set_temperature
+            target:
+              entity_id: !input ac_climate
+            data:
+              temperature: "{{ desired_setpoint }}"
