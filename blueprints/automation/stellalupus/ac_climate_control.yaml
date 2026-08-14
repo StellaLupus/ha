@@ -30,11 +30,14 @@ blueprint:
     кондиционера; пропускается, если встроенный датчик давно не обновлялся
     (застрял) — иначе коррекция бьёт по устаревшим данным.
 
-    Все решения о смене hvac_mode защищены собственным (не завязанным на
-    last_changed climate-сущности — там наблюдалась гонка при быстрых
-    последовательных срабатываниях) таймером минимального интервала,
-    хранящимся в отдельном input_datetime helper'е — это же лечит
-    наблюдавшийся баг двойного переключения режима в течение 10мс.
+    Все решения о смене hvac_mode защищены собственным таймером минимального
+    интервала (input_datetime helper, а не last_changed climate-сущности)
+    плюс нативным `condition: state ... for: {seconds: 3}` — второй барьер
+    проверяется центральным движком HA по факту непрерывности состояния, а
+    не нашим шаблоном, и не подвержен гонке между двумя почти одновременно
+    стартовавшими прогонами автоматики (наблюдался баг двойного
+    переключения режима за единицы-десятки миллисекунд, который ни `mode:
+    single`, ни собственный таймер полностью не устраняли).
 
     Тумблер (input_boolean) включает/выключает всю автоматику для
     конкретного кондиционера.
@@ -326,6 +329,12 @@ actions:
         conditions:
           - condition: template
             value_template: "{{ current_mode != 'cool' }}"
+          - alias: "Нативная защита от гонки: режим должен быть стабилен хотя бы 3 сек (проверяется движком HA по факту, а не нашим шаблоном)"
+            condition: state
+            entity_id: !input ac_climate
+            state: ["fan_only", "dry"]
+            for:
+              seconds: 3
           - condition: template
             value_template: "{{ duty > 0.02 }}"
           - condition: template
@@ -347,6 +356,12 @@ actions:
         conditions:
           - condition: template
             value_template: "{{ current_mode == 'cool' }}"
+          - alias: "Нативная защита от гонки: режим должен быть стабилен хотя бы 3 сек (проверяется движком HA по факту, а не нашим шаблоном)"
+            condition: state
+            entity_id: !input ac_climate
+            state: "cool"
+            for:
+              seconds: 3
           - condition: template
             value_template: "{{ duty < 0.98 }}"
           - condition: template
@@ -368,6 +383,12 @@ actions:
         conditions:
           - condition: template
             value_template: "{{ current_mode in ['dry', 'fan_only'] }}"
+          - alias: "Нативная защита от гонки: режим должен быть стабилен хотя бы 3 сек (проверяется движком HA по факту, а не нашим шаблоном)"
+            condition: state
+            entity_id: !input ac_climate
+            state: ["dry", "fan_only"]
+            for:
+              seconds: 3
           - condition: template
             value_template: "{{ offphase_mode != current_mode }}"
           - condition: template
