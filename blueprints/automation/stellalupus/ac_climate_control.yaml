@@ -247,8 +247,11 @@ variables:
   window_seconds: "{{ (window_minutes | float(15)) * 60 }}"
   on_duration: "{{ duty * window_seconds }}"
   min_cycle_seconds: "{{ (states(min_interval_helper) | float(5)) * 60 }}"
-  seconds_since_mode_change: >-
+  seconds_since_mode_change_helper: >-
     {{ (now().timestamp() - (state_attr(last_mode_change_helper, 'timestamp') | default(0, true))) }}
+  seconds_since_entity_change: "{{ (now() - states[ac_climate].last_changed).total_seconds() }}"
+  seconds_since_mode_change: >-
+    {{ [seconds_since_mode_change_helper, seconds_since_entity_change] | min }}
   seconds_since_setpoint_correction: >-
     {{ (now().timestamp() - (state_attr(last_setpoint_correction_helper, 'timestamp') | default(0, true))) }}
   sensor_stale: >-
