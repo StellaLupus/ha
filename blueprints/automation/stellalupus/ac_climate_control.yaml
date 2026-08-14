@@ -1,33 +1,43 @@
 blueprint:
-  name: "Кондиционер: климат-контроль (cool/dry/fan_only)"
+  name: "Кондиционер: климат-контроль (duty-cycle + антиовершут)"
   description: >
-    Автоматически выбирает режим кондиционера (cool/dry/fan_only) по внешнему
-    датчику температуры/влажности, затем — если целевой режим И текущее
-    (живое) состояние кондиционера оба cool или dry — корректирует уставку
-    под реальную температуру (offset = температура_кондиционера -
-    температура_внешнего_датчика).
+    v2: time-proportioning (duty-cycle) вместо простого bang-bang гистерезиса.
 
-    Смена режима и коррекция уставки разнесены паузой в 2 секунды, чтобы не
-    слать в облачный API кондиционера (например, Haier) два запроса
-    одновременно. Смена режима дополнительно защищена минимальным интервалом
-    между переключениями (защита компрессора от частых стартов/стопов).
-    Коррекция уставки шлётся только когда сдвиг не меньше гистерезиса
-    температуры — чтобы не спамить кондиционер командами.
+    Вместо резкого переключения cool↔fan_only/dry на границах target±band,
+    автоматика на каждом такте (раз в минуту плюс по событиям датчиков)
+    пересчитывает "скважность" (duty) — долю времени, которую в текущем
+    15-минутном (настраивается) окне кондиционер должен провести в cool,
+    пропорционально отклонению ПРОГНОЗИРУЕМОЙ температуры от цели:
 
-    Если датчик влажности недоступен или его значение вне диапазона 0–100,
-    это блокирует только выбор режима dry (осушение), но не блокирует выбор
-    cool/fan_only по температуре и коррекцию уставки в целом — датчики
-    качества воздуха (Qingping и подобные) регулярно уходят в offline.
+      прогноз = внешний_датчик + скорость_изменения × горизонт_упреждения
+      error = прогноз - target
+      duty = clamp(error / ширина_зоны, 0, 1)
 
-    Приоритет режимов: охлаждение (cool) > осушение (dry) > вентиляция
-    (fan_only).
+    Скорость изменения берётся из отдельного helper'а derivative (native HA
+    helper, не Jinja-математика) на основе внешнего датчика температуры.
+    Прогнозирование на несколько минут вперёд гасит физическую тепловую
+    инерцию кондиционера (после команды "хватит охлаждать" комната по
+    инерции ещё проседает на 0.3-0.6°C) — переключение происходит чуть
+    раньше, до того как инерция пронесёт температуру мимо цели.
 
-    Автоматика никогда сама не включает и не выключает кондиционер из
-    состояния off — только меняет режим/уставку, пока он уже включён (в т.ч.
-    включён вручную — есть отдельный триггер на выход из off).
+    Пока duty строго между 0 и 1 — кондиционер переключается между cool и
+    off-фазой (dry/fan_only) по расчётной длительности фазы. При duty≈1
+    (сильно жарко) остаётся в cool непрерывно; при duty≈0 — не включает
+    cool вообще, только dry/fan_only по влажности.
 
-    Тумблер (input_boolean) включает/выключает всю автоматику для конкретного
-    кондиционера.
+    Смена уставки (climate.set_temperature) — отдельный, троттлящийся
+    (не чаще раза в N минут) offset-трюк, компенсирующий встроенный датчик
+    кондиционера; пропускается, если встроенный датчик давно не обновлялся
+    (застрял) — иначе коррекция бьёт по устаревшим данным.
+
+    Все решения о смене hvac_mode защищены собственным (не завязанным на
+    last_changed climate-сущности — там наблюдалась гонка при быстрых
+    последовательных срабатываниях) таймером минимального интервала,
+    хранящимся в отдельном input_datetime helper'е — это же лечит
+    наблюдавшийся баг двойного переключения режима в течение 10мс.
+
+    Тумблер (input_boolean) включает/выключает всю автоматику для
+    конкретного кондиционера.
   domain: automation
   author: StellaLupus
   source_url: https://github.com/StellaLupus/ha/blob/main/blueprints/automation/stellalupus/ac_climate_control.yaml
@@ -62,9 +72,19 @@ blueprint:
             entity:
               domain: sensor
               device_class: humidity
+        temp_rate_sensor:
+          name: Датчик скорости изменения температуры
+          description: >
+            Derivative-helper (HA helper "Производная") на основе датчика
+            температуры этого помещения, unit_time=min. Используется для
+            прогноза температуры на несколько минут вперёд и гашения
+            овершута от тепловой инерции кондиционера.
+          selector:
+            entity:
+              domain: sensor
 
     helpers:
-      name: Параметры (input_number / input_boolean)
+      name: Параметры (input_number / input_datetime / input_boolean)
       icon: mdi:tune
       description: >
         Существующие helper-сущности для этого кондиционера. Каждый
@@ -83,7 +103,21 @@ blueprint:
             entity:
               domain: input_number
         temp_hysteresis_helper:
-          name: Гистерезис температуры
+          name: Ширина пропорциональной зоны (duty-cycle)
+          description: >
+            Отклонение прогнозируемой температуры от цели (°C), при
+            котором duty достигает 1 (кондиционер работает в cool
+            непрерывно). Меньше значение — агрессивнее реакция на
+            небольшие отклонения, но больше переключений режима.
+          selector:
+            entity:
+              domain: input_number
+        setpoint_hysteresis_helper:
+          name: Гистерезис коррекции уставки
+          description: >
+            Порог для коррекции уставки (climate.set_temperature) —
+            команда шлётся только если расчётная уставка отличается от
+            текущей не меньше чем на это значение.
           selector:
             entity:
               domain: input_number
@@ -103,6 +137,22 @@ blueprint:
           selector:
             entity:
               domain: input_number
+        last_mode_change_helper:
+          name: Метка времени последней смены режима (служебное)
+          description: >
+            input_datetime, в который автоматика сама пишет текущее время
+            сразу при каждой смене hvac_mode. Используется вместо
+            last_changed climate-сущности для защиты от гонки при быстрых
+            последовательных срабатываниях.
+          selector:
+            entity:
+              domain: input_datetime
+        last_setpoint_correction_helper:
+          name: Метка времени последней коррекции уставки (служебное)
+          description: input_datetime для троттлинга offset-коррекции уставки.
+          selector:
+            entity:
+              domain: input_datetime
 
     settings:
       name: Настройки поведения
@@ -124,32 +174,87 @@ blueprint:
           default: 2
           selector:
             number: { min: 0, max: 10, unit_of_measurement: "сек", mode: box }
+        window_minutes:
+          name: Окно duty-цикла
+          description: >
+            Минуты. При промежуточном duty (0<duty<1) кондиционер проводит
+            в cool долю window_minutes×duty, остальное время — в off-фазе
+            (dry/fan_only). Должно быть заметно больше мин. интервала
+            смены режима.
+          default: 15
+          selector:
+            number: { min: 5, max: 60, unit_of_measurement: "мин", mode: box }
+        lag_minutes:
+          name: Горизонт упреждения (антиовершут)
+          description: >
+            Минуты. На сколько вперёд прогнозировать температуру по
+            текущей скорости изменения при расчёте duty. 0 — упреждение
+            выключено (чистый duty-cycle без антиовершута).
+          default: 4
+          selector:
+            number: { min: 0, max: 15, unit_of_measurement: "мин", mode: box }
+        setpoint_correction_interval_minutes:
+          name: Мин. интервал коррекции уставки
+          description: Минуты. Не чаще какого интервала слать climate.set_temperature.
+          default: 20
+          selector:
+            number: { min: 5, max: 60, unit_of_measurement: "мин", mode: box }
+        sensor_staleness_minutes:
+          name: Порог "застрявшего" датчика кондиционера
+          description: >
+            Минуты. Если встроенный датчик кондиционера (current_temperature)
+            не обновлялся дольше этого времени, коррекция уставки в этом
+            такте пропускается — offset считался бы по устаревшим данным.
+          default: 10
+          selector:
+            number: { min: 3, max: 60, unit_of_measurement: "мин", mode: box }
 
 variables:
   ac_climate: !input ac_climate
   temp_sensor: !input temp_sensor
   humidity_sensor: !input humidity_sensor
+  rate_sensor: !input temp_rate_sensor
   enable_toggle: !input enable_toggle
   target_temp_helper: !input target_temp_helper
-  temp_hysteresis_helper: !input temp_hysteresis_helper
+  band_helper: !input temp_hysteresis_helper
+  setpoint_hysteresis_helper: !input setpoint_hysteresis_helper
   humidity_threshold_helper: !input humidity_threshold_helper
   humidity_hysteresis_helper: !input humidity_hysteresis_helper
   min_interval_helper: !input min_interval_helper
+  last_mode_change_helper: !input last_mode_change_helper
+  last_setpoint_correction_helper: !input last_setpoint_correction_helper
   min_valid_temp: !input min_valid_temp
   mode_switch_delay: !input mode_switch_delay
+  window_minutes: !input window_minutes
+  lag_minutes: !input lag_minutes
+  setpoint_correction_interval_minutes: !input setpoint_correction_interval_minutes
+  sensor_staleness_minutes: !input sensor_staleness_minutes
   current_mode: "{{ states(ac_climate) }}"
   t: "{{ states(temp_sensor) | float(0) }}"
   h: "{{ states(humidity_sensor) | float(0) }}"
+  rate: "{{ states(rate_sensor) | float(0) }}"
   target: "{{ states(target_temp_helper) | float(24) }}"
-  th: "{{ states(temp_hysteresis_helper) | float(1) }}"
+  band: "{{ [states(band_helper) | float(1), 0.1] | max }}"
+  setpoint_th: "{{ states(setpoint_hysteresis_helper) | float(0.3) }}"
   hmax: "{{ states(humidity_threshold_helper) | float(60) }}"
   hh: "{{ states(humidity_hysteresis_helper) | float(5) }}"
   humidity_valid: >-
     {{ states(humidity_sensor) not in ['unavailable', 'unknown', 'none', 'None']
        and 0 < (states(humidity_sensor) | float(-1)) < 100 }}
-  target_mode: "{% if t >= target + th or (current_mode == 'cool' and t > target - th) %}cool{% elif humidity_valid and (h >= hmax + hh or (current_mode == 'dry' and h > hmax - hh)) %}dry{% else %}fan_only{% endif %}"
-  seconds_since_last_change: "{{ (now() - states[ac_climate].last_changed).total_seconds() }}"
+  predicted_t: "{{ t + rate * lag_minutes }}"
+  error: "{{ predicted_t - target }}"
+  duty: "{{ [[(error / band), 0] | max, 1] | min }}"
+  window_seconds: "{{ (window_minutes | float(15)) * 60 }}"
+  on_duration: "{{ duty * window_seconds }}"
   min_cycle_seconds: "{{ (states(min_interval_helper) | float(5)) * 60 }}"
+  seconds_since_mode_change: >-
+    {{ (now().timestamp() - (state_attr(last_mode_change_helper, 'timestamp') | default(0, true))) }}
+  seconds_since_setpoint_correction: >-
+    {{ (now().timestamp() - (state_attr(last_setpoint_correction_helper, 'timestamp') | default(0, true))) }}
+  sensor_stale: >-
+    {{ (now().timestamp() - as_timestamp(states[ac_climate].last_updated)) > (sensor_staleness_minutes | float(10)) * 60 }}
+  offphase_mode: >-
+    {% if humidity_valid and (h >= hmax + hh or (current_mode == 'dry' and h > hmax - hh)) %}dry{% else %}fan_only{% endif %}
 
 triggers:
   - trigger: state
@@ -159,11 +264,17 @@ triggers:
     entity_id: !input humidity_sensor
     id: humidity_updated
   - trigger: state
+    entity_id: !input temp_rate_sensor
+    id: rate_updated
+  - trigger: state
     entity_id: !input target_temp_helper
     id: target_temp_changed
   - trigger: state
     entity_id: !input temp_hysteresis_helper
-    id: temp_hyst_changed
+    id: band_changed
+  - trigger: state
+    entity_id: !input setpoint_hysteresis_helper
+    id: setpoint_hyst_changed
   - trigger: state
     entity_id: !input humidity_threshold_helper
     id: humidity_max_changed
@@ -179,16 +290,15 @@ triggers:
     id: auto_control_enabled
   - trigger: state
     entity_id: !input ac_climate
-    to: ["cool", "dry"]
-    id: entered_cool_or_dry
-  - trigger: state
-    entity_id: !input ac_climate
     from: "off"
     id: manual_power_on
   - trigger: state
     entity_id: !input ac_climate
     attribute: current_temperature
     id: ac_sensor_updated
+  - trigger: time_pattern
+    minutes: "/1"
+    id: tick
 
 conditions:
   - condition: state
@@ -203,34 +313,83 @@ conditions:
     entity_id: !input temp_sensor
     above: !input min_valid_temp
 
-mode: restart
+mode: queued
+max: 10
 
 actions:
-  - alias: "Меняем режим, если он должен измениться (с защитой от частого переключения компрессора)"
+  - alias: "Выбор режима: duty-cycle с антиовершутом по производной"
     choose:
-      - conditions:
+      - alias: "Входим/возвращаемся в cool"
+        conditions:
           - condition: template
-            value_template: "{{ target_mode != current_mode }}"
+            value_template: "{{ current_mode != 'cool' }}"
           - condition: template
-            value_template: "{{ seconds_since_last_change >= min_cycle_seconds }}"
+            value_template: "{{ duty > 0.02 }}"
+          - condition: template
+            value_template: "{{ duty >= 0.98 or seconds_since_mode_change >= (window_seconds - on_duration) }}"
+          - condition: template
+            value_template: "{{ seconds_since_mode_change >= min_cycle_seconds }}"
         sequence:
           - action: climate.set_hvac_mode
             target:
               entity_id: !input ac_climate
             data:
-              hvac_mode: "{{ target_mode }}"
-          - alias: "Пауза перед возможной коррекцией уставки, чтобы команды не улетели в облако одновременно"
-            delay:
-              seconds: "{{ mode_switch_delay }}"
+              hvac_mode: cool
+          - action: input_datetime.set_datetime
+            target:
+              entity_id: !input last_mode_change_helper
+            data:
+              datetime: "{{ now() }}"
+      - alias: "Выходим из cool по расчётной длительности фазы"
+        conditions:
+          - condition: template
+            value_template: "{{ current_mode == 'cool' }}"
+          - condition: template
+            value_template: "{{ duty < 0.98 }}"
+          - condition: template
+            value_template: "{{ seconds_since_mode_change >= on_duration }}"
+          - condition: template
+            value_template: "{{ seconds_since_mode_change >= min_cycle_seconds }}"
+        sequence:
+          - action: climate.set_hvac_mode
+            target:
+              entity_id: !input ac_climate
+            data:
+              hvac_mode: "{{ offphase_mode }}"
+          - action: input_datetime.set_datetime
+            target:
+              entity_id: !input last_mode_change_helper
+            data:
+              datetime: "{{ now() }}"
+      - alias: "В off-фазе — подстройка dry/fan_only по влажности"
+        conditions:
+          - condition: template
+            value_template: "{{ current_mode in ['dry', 'fan_only'] }}"
+          - condition: template
+            value_template: "{{ offphase_mode != current_mode }}"
+          - condition: template
+            value_template: "{{ seconds_since_mode_change >= min_cycle_seconds }}"
+        sequence:
+          - action: climate.set_hvac_mode
+            target:
+              entity_id: !input ac_climate
+            data:
+              hvac_mode: "{{ offphase_mode }}"
+          - action: input_datetime.set_datetime
+            target:
+              entity_id: !input last_mode_change_helper
+            data:
+              datetime: "{{ now() }}"
 
-  - alias: "Коррекция уставки под реальную температуру — только когда целевой режим и ЖИВОЕ состояние кондиционера — cool или dry"
+  - alias: "Коррекция уставки под реальную температуру (троттлинг + защита от устаревшего встроенного датчика)"
     choose:
       - conditions:
           - condition: template
-            value_template: "{{ target_mode in ['cool', 'dry'] }}"
-          - condition: state
-            entity_id: !input ac_climate
-            state: ["cool", "dry"]
+            value_template: "{{ current_mode in ['cool', 'dry'] }}"
+          - condition: template
+            value_template: "{{ not sensor_stale }}"
+          - condition: template
+            value_template: "{{ seconds_since_setpoint_correction >= setpoint_correction_interval_minutes * 60 }}"
           - condition: numeric_state
             entity_id: !input ac_climate
             attribute: current_temperature
@@ -246,10 +405,17 @@ actions:
               desired_setpoint: "{{ [[raw_setpoint, 16] | max, 30] | min | round(0) }}"
               current_setpoint: "{{ state_attr(ac_climate, 'temperature') | float(0) }}"
           - condition: template
-            alias: "Отправляем команду только при изменении не меньше гистерезиса температуры (th), чтобы не спамить кондиционер"
-            value_template: "{{ (desired_setpoint - current_setpoint) | abs >= th }}"
+            alias: "Отправляем только при изменении не меньше гистерезиса коррекции уставки"
+            value_template: "{{ (desired_setpoint - current_setpoint) | abs >= setpoint_th }}"
+          - delay:
+              seconds: "{{ mode_switch_delay }}"
           - action: climate.set_temperature
             target:
               entity_id: !input ac_climate
             data:
               temperature: "{{ desired_setpoint }}"
+          - action: input_datetime.set_datetime
+            target:
+              entity_id: !input last_setpoint_correction_helper
+            data:
+              datetime: "{{ now() }}"
