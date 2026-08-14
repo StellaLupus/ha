@@ -313,8 +313,8 @@ conditions:
     entity_id: !input temp_sensor
     above: !input min_valid_temp
 
-mode: queued
-max: 10
+mode: single
+max_exceeded: silent
 
 actions:
   - alias: "Выбор режима: duty-cycle с антиовершутом по производной"
