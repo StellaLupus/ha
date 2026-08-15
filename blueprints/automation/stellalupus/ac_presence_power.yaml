@@ -1,27 +1,28 @@
 blueprint:
-  name: "Кондиционер: вкл/выкл по присутствию"
+  name: "Кондиционер: выкл по присутствию"
   description: >
-    Включает кондиционер, когда кто-то приближается к дому (входит в
-    широкую зону approach_zone, например радиусом 5 км) или уже оказался
-    дома (zone.home переходит из 0 в 1+), и выключает его, когда дом
-    полностью опустел (zone.home падает до 0 — с задержкой
-    home_departure_delay, чтобы кратковременная потеря GPS-сигнала не
-    вызывала ложное выключение).
+    Выключает кондиционер, когда дом полностью опустел (zone.home падает
+    до 0 — с задержкой home_departure_delay, чтобы кратковременная потеря
+    GPS-сигнала не вызывала ложное выключение).
 
     zone.home — встроенная зона Home Assistant; её числовое состояние
     равно количеству отслеживаемых person-сущностей внутри неё, поэтому
     blueprint не требует перечислять конкретных людей — работает для
     любого числа домочадцев с настроенными device_tracker'ами.
 
-    Реагирует только на сам момент переключения присутствия (условие
-    "кондиционер сейчас в other состоянии") — если кондиционер выключен
-    вручную, пока кто-то дома, автоматика не станет включать его снова
-    сама, пока не будет нового «приезда»/«подъезда».
+    v2: автоматическое включение по приезду/приближению к дому убрано —
+    трекеры присутствия оказались недостаточно надёжны (ложные geofence-
+    переходы без GPS-фикса, залипание координат на несколько часов),
+    из-за чего кондиционер иногда выключался, пока человек был дома, а
+    затем включался бы обратно по ложному "приезду" — непредсказуемо.
+    Включение теперь только вручную или через отдельную автоматику
+    климат-контроля (ac_climate_control.yaml), если/когда решите её
+    настроить на самостоятельное включение.
 
-    После включения конкретный режим (cool/dry/fan_only) и уставка
-    подхватываются отдельным blueprint'ом климат-контроля
-    (ac_climate_control.yaml, тот же репозиторий) — эта автоматика
-    отвечает только за вкл/выкл, не за выбор режима.
+    После выключения дальнейшее управление режимом/уставкой не
+    выполняется — этим занимается отдельный blueprint климат-контроля
+    (ac_climate_control.yaml, тот же репозиторий), пока кондиционер
+    включён.
   domain: automation
   author: StellaLupus
   source_url: https://github.com/StellaLupus/ha/blob/main/blueprints/automation/stellalupus/ac_presence_power.yaml
@@ -39,34 +40,11 @@ blueprint:
             entity:
               domain: climate
 
-    zones:
-      name: Зоны присутствия
-      icon: mdi:map-marker-radius
-      input:
-        approach_zone:
-          name: Зона "подъезжаю к дому"
-          description: >
-            Более широкая зона вокруг дома (например, 5 км) — используется
-            через её числовое состояние (количество людей внутри) для
-            предварительного включения кондиционера ещё по пути домой.
-          selector:
-            entity:
-              domain: zone
-
     settings:
       name: Настройки поведения
       icon: mdi:cog
       collapsed: true
       input:
-        arrival_hvac_mode:
-          name: Режим при включении
-          description: >
-            Временный режим при включении — конкретный режим и уставку
-            тут же скорректирует автоматика климат-контроля.
-          default: cool
-          selector:
-            select:
-              options: ["cool", "dry", "fan_only", "auto"]
         home_departure_delay:
           name: Задержка перед выключением при отъезде
           description: Минуты. Защита от кратковременных потерь GPS-сигнала (zone.home на секунду падает до 0).
@@ -84,14 +62,6 @@ triggers:
     for:
       minutes: "{{ home_departure_delay }}"
     id: everybody_left
-  - trigger: numeric_state
-    entity_id: zone.home
-    above: 0
-    id: somebody_arrived
-  - trigger: numeric_state
-    entity_id: !input approach_zone
-    above: 0
-    id: approaching
 
 mode: restart
 
@@ -112,18 +82,3 @@ actions:
               entity_id: !input ac_climate
             data:
               hvac_mode: "off"
-
-  - alias: "Кто-то подъезжает или уже дома — включаем кондиционер"
-    choose:
-      - conditions:
-          - condition: trigger
-            id: ["somebody_arrived", "approaching"]
-          - condition: state
-            entity_id: !input ac_climate
-            state: "off"
-        sequence:
-          - action: climate.set_hvac_mode
-            target:
-              entity_id: !input ac_climate
-            data:
-              hvac_mode: !input arrival_hvac_mode
