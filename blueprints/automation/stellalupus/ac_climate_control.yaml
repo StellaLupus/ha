@@ -25,12 +25,19 @@ blueprint:
     идёт на 0.3-0.6°C дальше) — переключение происходит чуть раньше, до
     того как инерция пронесёт температуру мимо цели.
 
-    Off-фаза duty-цикла зависит от направления: в охлаждении это dry или
-    fan_only по влажности (как в v2), в обогреве и в простое — off
-    (вентиляция при обогреве гоняет воздух комнатной температуры, который
-    из-за обдува ощущается холодным). Горизонт упреждения вынесен в
-    отдельный helper, общий с арбитром: если бы у них разошёлся горизонт,
-    арбитр разворачивал бы контур не тогда, когда комнаты этого ждут.
+    Off-фаза duty-цикла: dry, если в охлаждении влажность выше порога,
+    иначе off. Режим fan_only не используется вообще — вентиляция без
+    компрессора ничего не даёт, шумит, а при обогреве ещё и гоняет воздух
+    комнатной температуры, который из-за обдува ощущается холодным.
+
+    Осушение включается и из состояния off, а не только из активной
+    off-фазы: иначе блок, оказавшийся выключенным при отсутствии
+    потребности в холоде, уже никогда бы не начал осушать, даже когда
+    влажность ушла за порог.
+
+    Горизонт упреждения вынесен в отдельный helper, общий с арбитром: если
+    бы у них разошёлся горизонт, арбитр разворачивал бы контур не тогда,
+    когда комнаты этого ждут.
 
     ВАЖНО: since v3 состояние off — рабочая фаза паузы обогрева, а не
     сигнал "не трогай". Автоматика включит кондиционер обратно, когда
@@ -341,9 +348,9 @@ variables:
   sensor_stale: >-
     {{ (now().timestamp() - as_timestamp(states[ac_climate].last_updated)) > (sensor_staleness_minutes | float(10)) * 60 }}
   offphase_mode: >-
-    {% if is_cool and humidity_valid and (h >= hmax + hh or (current_mode == 'dry' and h > hmax - hh)) %}dry{% elif is_cool %}fan_only{% else %}off{% endif %}
+    {% if is_cool and humidity_valid and (h >= hmax + hh or (current_mode == 'dry' and h > hmax - hh)) %}dry{% else %}off{% endif %}
   forbidden_modes: >-
-    {{ ['cool', 'dry', 'auto'] if is_heat else (['heat', 'auto'] if is_cool else ['cool', 'dry', 'heat', 'auto']) }}
+    {{ ['cool', 'dry', 'fan_only', 'auto'] if is_heat else (['heat', 'fan_only', 'auto'] if is_cool else ['cool', 'dry', 'heat', 'fan_only', 'auto']) }}
   opposite_modes: >-
     {{ ['cool', 'dry'] if is_heat else (['heat'] if is_cool else []) }}
   conflict_free: >-
@@ -450,7 +457,7 @@ actions:
           - alias: "Нативная защита от гонки: режим должен быть стабилен хотя бы 3 сек (проверяется движком HA по факту, а не нашим шаблоном)"
             condition: state
             entity_id: !input ac_climate
-            state: ["fan_only", "dry", "off"]
+            state: ["dry", "off"]
             for:
               seconds: 3
           - alias: "Ни один соседний блок не работает в противоположную сторону"
@@ -509,7 +516,7 @@ actions:
           - alias: "Нативная защита от гонки: режим должен быть стабилен хотя бы 3 сек (проверяется движком HA по факту, а не нашим шаблоном)"
             condition: state
             entity_id: !input ac_climate
-            state: ["off", "fan_only"]
+            state: "off"
             for:
               seconds: 3
           - alias: "Ни один соседний блок не работает в противоположную сторону"
@@ -561,14 +568,14 @@ actions:
             data:
               datetime: "{{ now() }}"
 
-      - alias: "В off-фазе охлаждения — подстройка dry/fan_only по влажности"
+      - alias: "В off-фазе охлаждения — включаем/выключаем осушение по влажности (в т.ч. из off: иначе блок, оказавшийся выключенным без потребности в холоде, уже никогда не начнёт осушать)"
         conditions:
           - condition: template
-            value_template: "{{ is_cool and current_mode in ['dry', 'fan_only'] }}"
+            value_template: "{{ is_cool and current_mode in ['dry', 'off'] }}"
           - alias: "Нативная защита от гонки: режим должен быть стабилен хотя бы 3 сек (проверяется движком HA по факту, а не нашим шаблоном)"
             condition: state
             entity_id: !input ac_climate
-            state: ["dry", "fan_only"]
+            state: ["dry", "off"]
             for:
               seconds: 3
           - condition: template
@@ -581,30 +588,6 @@ actions:
               entity_id: !input ac_climate
             data:
               hvac_mode: "{{ offphase_mode }}"
-          - action: input_datetime.set_datetime
-            target:
-              entity_id: !input last_mode_change_helper
-            data:
-              datetime: "{{ now() }}"
-
-      - alias: "Простой — гасим и вентиляцию тоже"
-        conditions:
-          - condition: template
-            value_template: "{{ is_idle and current_mode == 'fan_only' }}"
-          - alias: "Нативная защита от гонки: режим должен быть стабилен хотя бы 3 сек (проверяется движком HA по факту, а не нашим шаблоном)"
-            condition: state
-            entity_id: !input ac_climate
-            state: "fan_only"
-            for:
-              seconds: 3
-          - condition: template
-            value_template: "{{ seconds_since_mode_change >= min_cycle_seconds }}"
-        sequence:
-          - action: climate.set_hvac_mode
-            target:
-              entity_id: !input ac_climate
-            data:
-              hvac_mode: "off"
           - action: input_datetime.set_datetime
             target:
               entity_id: !input last_mode_change_helper
