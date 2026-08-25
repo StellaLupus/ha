@@ -1,6 +1,20 @@
 blueprint:
   name: "Кондиционер: климат-контроль (duty-cycle + антиовершут + обогрев)"
   description: >
+    v3.1: у комнаты одна целевая температура на оба направления, а порог
+    входа в обогрев — отдельная величина, только условие входа. Раньше
+    обогрев вёл комнату к своей цели, совпадавшей с порогом: нагрев
+    останавливался ровно там, где арбитр ещё считает, что холодно, и
+    контур залипал в обогреве, которого никто не выполнял.
+
+    Порог при этом никуда не делся из логики блока: направление контура
+    разрешает обогрев, но не обязывает. Комната входит в heat только если
+    прогноз ниже её порога, а уже внутри эпизода нагрева планка
+    поднимается до целевой — иначе нагрев замирал бы на пороге, как в v3.
+    Без этого условия комната, которой ничего не надо, начинала бы греться
+    просто потому, что соседняя утащила контур в обогрев, и могла бы
+    разогреться до собственной потребности в холоде.
+
     v3: добавлен обогрев и соблюдение единого направления мультисплита.
 
     Внутренние блоки мультисплита висят на одном наружном блоке: контур
@@ -14,9 +28,13 @@ blueprint:
     то, какой режим считается рабочим:
 
       прогноз = внешний_датчик + скорость_изменения × горизонт_упреждения
-      охлаждение: error = прогноз - целевая_охлаждения,  рабочий режим cool
-      обогрев:    error = целевая_обогрева - прогноз,    рабочий режим heat
+      охлаждение: error = прогноз - целевая,  рабочий режим cool
+      обогрев:    error = целевая - прогноз,  рабочий режим heat
       duty = clamp(error / ширина_зоны, 0, 1)
+
+    Целевая одна и та же в обе стороны — разница только в знаке ошибки.
+    Порог входа в обогрев в этой математике не участвует: он живёт в
+    арбитре и решает, когда разворачивать контур, а не докуда греть.
 
     Скорость изменения берётся из отдельного helper'а derivative (native HA
     helper, не Jinja-математика) на основе внешнего датчика температуры.
@@ -68,7 +86,26 @@ blueprint:
     (3) арбитр не разворачивает контур чаще заданного интервала. Вместе это
     даёт безопасный двухфазный разворот без явной оркестрации.
 
-    Все решения о смене hvac_mode дополнительно защищены собственным
+    Барьер минимального интервала асимметричен: ВХОД в рабочий режим он
+    держит всегда (защита компрессора от частых пусков), а выход — только
+    пока цель не достигнута. Симметричный барьер додерживал блок в
+    рабочем режиме и после достижения цели: комната уезжала за цель ровно
+    на длину барьера, а в обогреве это ещё и роняло её под порог входа,
+    разворачивая весь контур. Совсем без барьера на выходе тоже нельзя:
+    on_duration пересчитывается каждый прогон, поэтому скачок производной
+    обнулял бы расчётную длительность фазы и давал пуски компрессора по
+    20-60 секунд. Отсюда развилка: duty упал в ноль (цель взята) — гасим
+    сразу, duty просто просел — держим минимальное время работы.
+
+    Вынужденная пауза после разворота контура не считается фазой
+    duty-цикла: её начал не duty-цикл, а смена направления, поэтому
+    ожидание (окно − on_duration) к ней не применяется. Определяется она
+    по близости отметок времени смены режима и смены направления, а не по
+    отказу писать метку: отсчёт всё равно обнуляется через last_changed
+    самой climate-сущности, которую set_hvac_mode сбрасывает, так что не
+    писать метку — значит просто оставить хелпер протухшим.
+
+    Решения о ВХОДЕ в hvac_mode дополнительно защищены собственным
     таймером минимального интервала (input_datetime helper, а не
     last_changed climate-сущности) плюс нативным
     `condition: state ... for: {seconds: 3}` — второй барьер проверяется
@@ -162,17 +199,31 @@ blueprint:
             entity:
               domain: input_select
         target_temp_helper:
-          name: Целевая температура (охлаждение)
+          name: Целевая температура (комфорт)
+          description: >
+            Единая цель комнаты для ОБОИХ направлений: и охлаждение, и
+            обогрев ведут комнату к этой температуре. Раньше у обогрева
+            была своя цель — из-за этого нагрев останавливался на пороге
+            входа в обогрев, то есть ровно там, где арбитр ещё считает,
+            что комнате холодно.
           selector:
             entity:
               domain: input_number
         heat_target_temp_helper:
-          name: Целевая температура (обогрев)
+          name: Порог входа в обогрев
           description: >
-            Должна быть заметно НИЖЕ целевой охлаждения — промежуток между
-            ними это мёртвая зона, в которой комната ничего не требует.
-            Комнате, которую греть почти никогда не надо, ставьте низкое
-            значение: она сама останется выключенной.
+            ТОЛЬКО условие разворота контура, не цель нагрева. Когда
+            прогноз опускается ниже этого значения, арбитр переводит весь
+            мультисплит в обогрев, а греет блок уже до целевой
+            температуры (комфорт). Должен быть заметно НИЖЕ цели —
+            промежуток между ними это мёртвая зона, в которой комната
+            ничего не требует. Комнате, которую греть почти никогда не
+            надо, ставьте низкое значение.
+
+            Ключ входа исторически называется heat_target_temp_helper (в
+            v3 это была отдельная цель обогрева). Имя ключа сохранено
+            намеренно: переименование сломало бы уже созданные из этого
+            blueprint автоматизации с MissingInput.
           selector:
             entity:
               domain: input_number
@@ -328,9 +379,8 @@ variables:
   h: "{{ states(humidity_sensor) | float(0) }}"
   rate: "{{ states(rate_sensor) | float(0) }}"
   lag_minutes: "{{ states(lag_helper) | float(4) }}"
-  target_cool: "{{ states(target_temp_helper) | float(24) }}"
-  target_heat: "{{ states(heat_target_temp_helper) | float(21) }}"
-  target: "{{ target_heat if is_heat else target_cool }}"
+  target: "{{ states(target_temp_helper) | float(24) }}"
+  heat_trigger: "{{ states(heat_target_temp_helper) | float(21) }}"
   band: "{{ [states(band_helper) | float(1), 0.1] | max }}"
   setpoint_th: "{{ states(setpoint_hysteresis_helper) | float(0.3) }}"
   hmax: "{{ states(humidity_threshold_helper) | float(60) }}"
@@ -350,6 +400,16 @@ variables:
   seconds_since_entity_change: "{{ (now() - states[ac_climate].last_changed).total_seconds() }}"
   seconds_since_mode_change: >-
     {{ [seconds_since_mode_change_helper, seconds_since_entity_change] | min }}
+  seconds_since_direction_change: >-
+    {{ (now() - states[system_direction_helper].last_changed).total_seconds() }}
+  forced_offphase: >-
+    {{ seconds_since_direction_change <= window_seconds
+       and (seconds_since_mode_change - seconds_since_direction_change) | abs <= 60 }}
+  at_target: "{{ duty <= 0.02 }}"
+  heat_episode_active: >-
+    {{ current_mode == 'heat' or seconds_since_mode_change < window_seconds }}
+  heat_needed: >-
+    {{ predicted_t < (target if heat_episode_active else heat_trigger) }}
   seconds_since_setpoint_correction: >-
     {{ (now().timestamp() - (state_attr(last_setpoint_correction_helper, 'timestamp') | default(0, true))) }}
   sensor_stale: >-
@@ -384,7 +444,7 @@ triggers:
     id: target_temp_changed
   - trigger: state
     entity_id: !input heat_target_temp_helper
-    id: heat_target_temp_changed
+    id: heat_trigger_temp_changed
   - trigger: state
     entity_id: !input temp_hysteresis_helper
     id: band_changed
@@ -451,7 +511,8 @@ actions:
               entity_id: !input ac_climate
             data:
               hvac_mode: "{{ offphase_mode }}"
-          - action: input_datetime.set_datetime
+          - alias: "Метку обновляем как при любой смене фазы: отсчёт всё равно обнуляется через last_changed climate-сущности, которую set_hvac_mode сбрасывает, поэтому не писать её — значит просто оставить хелпер протухшим. Вынужденность этой фазы учитывается отдельно, через forced_offphase"
+            action: input_datetime.set_datetime
             target:
               entity_id: !input last_mode_change_helper
             data:
@@ -472,8 +533,9 @@ actions:
             value_template: "{{ conflict_free }}"
           - condition: template
             value_template: "{{ duty > 0.02 }}"
-          - condition: template
-            value_template: "{{ duty >= 0.98 or seconds_since_mode_change >= (window_seconds - on_duration) }}"
+          - alias: "Ожидание фазы duty-цикла не применяется к вынужденной паузе после разворота контура: её начал не duty-цикл, а смена направления"
+            condition: template
+            value_template: "{{ duty >= 0.98 or forced_offphase or seconds_since_mode_change >= (window_seconds - on_duration) }}"
           - condition: template
             value_template: "{{ seconds_since_mode_change >= min_cycle_seconds }}"
         sequence:
@@ -502,8 +564,9 @@ actions:
             value_template: "{{ duty < 0.98 }}"
           - condition: template
             value_template: "{{ seconds_since_mode_change >= on_duration }}"
-          - condition: template
-            value_template: "{{ seconds_since_mode_change >= min_cycle_seconds }}"
+          - alias: "Барьер асимметричный, но не бесплатный: цель достигнута (duty упал в ноль) — гасим сразу, иначе блок доводит комнату за цель ровно на длину барьера. Если же цель ещё не достигнута, а duty просто просел (скакнула производная), держим минимальное время работы: on_duration пересчитывается каждый прогон, и без этого пола компрессор ловил бы пуски по 20-60 секунд"
+            condition: template
+            value_template: "{{ at_target or seconds_since_mode_change >= min_cycle_seconds }}"
         sequence:
           - action: climate.set_hvac_mode
             target:
@@ -520,6 +583,9 @@ actions:
         conditions:
           - condition: template
             value_template: "{{ is_heat and current_mode != 'heat' }}"
+          - alias: "Направление контура разрешает обогрев, но не обязывает: греем только комнату с собственной потребностью. Вход — ниже порога, дальше планка поднимается до целевой, иначе нагрев замирал бы на пороге, как в v3"
+            condition: template
+            value_template: "{{ heat_needed }}"
           - alias: "Нативная защита от гонки: режим должен быть стабилен хотя бы 3 сек (проверяется движком HA по факту, а не нашим шаблоном)"
             condition: state
             entity_id: !input ac_climate
@@ -531,8 +597,9 @@ actions:
             value_template: "{{ conflict_free }}"
           - condition: template
             value_template: "{{ duty > 0.02 }}"
-          - condition: template
-            value_template: "{{ duty >= 0.98 or seconds_since_mode_change >= (window_seconds - on_duration) }}"
+          - alias: "Ожидание фазы duty-цикла не применяется к вынужденной паузе после разворота контура: её начал не duty-цикл, а смена направления"
+            condition: template
+            value_template: "{{ duty >= 0.98 or forced_offphase or seconds_since_mode_change >= (window_seconds - on_duration) }}"
           - condition: template
             value_template: "{{ seconds_since_mode_change >= min_cycle_seconds }}"
         sequence:
@@ -561,8 +628,9 @@ actions:
             value_template: "{{ duty < 0.98 }}"
           - condition: template
             value_template: "{{ seconds_since_mode_change >= on_duration }}"
-          - condition: template
-            value_template: "{{ seconds_since_mode_change >= min_cycle_seconds }}"
+          - alias: "Барьер асимметричный, но не бесплатный: цель достигнута (duty упал в ноль) — гасим сразу, иначе блок доводит комнату за цель ровно на длину барьера. Если же цель ещё не достигнута, а duty просто просел (скакнула производная), держим минимальное время работы: on_duration пересчитывается каждый прогон, и без этого пола компрессор ловил бы пуски по 20-60 секунд"
+            condition: template
+            value_template: "{{ at_target or seconds_since_mode_change >= min_cycle_seconds }}"
         sequence:
           - action: climate.set_hvac_mode
             target:
