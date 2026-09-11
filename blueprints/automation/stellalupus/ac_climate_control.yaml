@@ -393,9 +393,13 @@ blueprint:
             ВЫШЕ его показаний. Наблюдалось: 38 минут в cool, уставка 22 при
             датчике блока 21, комната за это время выросла с 24.3 до 24.9.
 
-            Смысл offset-трюка — заставить блок работать; останавливает его
-            duty-цикл, а не внутренний термостат. Поэтому величина поправки
-            не ограничивается, гарантируется только её направление.
+            Зазор применяется ТОЛЬКО пока работа ещё нужна (комната по ту
+            сторону цели). Когда цель достигнута, формула сама даёт уставку
+            равную показаниям датчика блока, а за целью — выше них, и блок
+            глушится собственным термостатом. Это страховка на случай, если
+            duty-цикл почему-то не успел выйти из режима, и безусловный зазор
+            её уничтожал: уставка навсегда оставалась ниже показаний, и блок
+            морозил комнату дальше.
           default: 1
           selector:
             number: { min: 0.5, max: 5, step: 0.5, unit_of_measurement: "°C", mode: box }
@@ -822,8 +826,10 @@ actions:
               ac_internal: "{{ state_attr(ac_climate, 'current_temperature') | float(0) }}"
               offset: "{{ ac_internal - t }}"
               raw_setpoint: "{{ target + offset }}"
+              work_still_needed: "{{ (t < target) if is_heat else (t > target) }}"
               runnable_setpoint: >-
-                {% if is_heat %}{{ [raw_setpoint, ac_internal + setpoint_margin] | max
+                {% if not work_still_needed %}{{ raw_setpoint
+                }}{% elif is_heat %}{{ [raw_setpoint, ac_internal + setpoint_margin] | max
                 }}{% else %}{{ [raw_setpoint, ac_internal - setpoint_margin] | min }}{% endif %}
               desired_setpoint: "{{ [[runnable_setpoint, 16] | max, 30] | min | round(0) }}"
               current_setpoint: "{{ state_attr(ac_climate, 'temperature') | float(0) }}"
