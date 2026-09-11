@@ -498,8 +498,17 @@ variables:
     {{ predicted_t < (target if heat_episode_active else heat_trigger) }}
   seconds_since_setpoint_correction: >-
     {{ (now().timestamp() - (state_attr(last_setpoint_correction_helper, 'timestamp') | default(0, true))) }}
+  # Свежесть считается по last_reported, а не по last_updated. last_updated
+  # двигается только при ИЗМЕНЕНИИ состояния или атрибутов, поэтому у стоящего
+  # блока со стабильными показаниями он естественным образом стареет на часы —
+  # и защита срабатывала ложно, блокируя коррекцию уставки именно тогда, когда
+  # она нужнее всего: блок заглушил себя своим термостатом, показания замерли,
+  # коррекция объявлена небезопасной, простой стал вечным (наблюдалось:
+  # last_updated 43 минуты назад при last_reported 9 секунд назад).
+  # last_reported обновляется на каждом отчёте интеграции, даже если значение
+  # то же самое, и отвечает на нужный вопрос: жив ли вообще канал данных.
   sensor_stale: >-
-    {{ (now().timestamp() - as_timestamp(states[ac_climate].last_updated)) > (sensor_staleness_minutes | float(10)) * 60 }}
+    {{ (now().timestamp() - as_timestamp(states[ac_climate].last_reported)) > (sensor_staleness_minutes | float(10)) * 60 }}
   # Осушение — работа компрессора на холод, но без цели и без выхода по
   # температуре: единственный выход из dry это влажность. Как off-фаза
   # duty-цикла оно уводило комнату на 1.5-3 °C ниже цели, пробивало порог
