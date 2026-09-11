@@ -370,14 +370,39 @@ blueprint:
           selector:
             number: { min: 5, max: 60, unit_of_measurement: "мин", mode: box }
         sensor_staleness_minutes:
-          name: Порог "застрявшего" датчика кондиционера
+          name: Порог молчания кондиционера
           description: >
-            Минуты. Если встроенный датчик кондиционера (current_temperature)
-            не обновлялся дольше этого времени, коррекция уставки в этом
-            такте пропускается — offset считался бы по устаревшим данным.
+            Минуты. Если интеграция кондиционера не присылала отчётов дольше
+            этого времени, коррекция уставки в этом такте пропускается: канал
+            данных считается мёртвым, и offset считался бы вслепую.
+
+            Это проверка ЖИВОСТИ канала (last_reported), а не свежести самого
+            значения. Раньше проверялся last_updated, но он двигается только
+            при изменении значений, поэтому у стоящего блока со стабильными
+            показаниями естественно стареет на часы — и защита срабатывала
+            ложно, блокируя коррекцию именно тогда, когда та была нужна.
+            Замерший при живом канале датчик эта проверка не ловит и поймать
+            не может: он неотличим от честно стабильной температуры. От
+            последствий защищает зазор уставки, а не этот порог.
+
+            Требует Home Assistant 2024.8+ (атрибут last_reported).
           default: 10
           selector:
             number: { min: 3, max: 60, unit_of_measurement: "мин", mode: box }
+        min_compressor_pause_minutes:
+          name: Минимальная пауза компрессора
+          description: >
+            Минуты. Сколько должно пройти с последней смены состояния блока —
+            любой, в том числе не нашей, — прежде чем разрешён новый пуск.
+            Отдельная величина от «мин. интервала смены режима»: тот считается
+            по собственной метке автоматики и рисует duty-цикл, а этот
+            защищает железо и потому обязан учитывать чужие остановки (блок
+            заглушил себя своим термостатом, пульт, отскок облака). Держите
+            его коротким: каждый чужой дребезг стоит ровно этого времени
+            простоя.
+          default: 3
+          selector:
+            number: { min: 0, max: 15, step: 0.5, unit_of_measurement: "мин", mode: box }
         setpoint_margin:
           name: Зазор уставки от датчика блока
           description: >
@@ -441,6 +466,7 @@ variables:
   setpoint_correction_interval_minutes: !input setpoint_correction_interval_minutes
   sensor_staleness_minutes: !input sensor_staleness_minutes
   setpoint_margin: !input setpoint_margin
+  min_compressor_pause_minutes: !input min_compressor_pause_minutes
   dry_undershoot_allowance: !input dry_undershoot_allowance
   current_mode: "{{ states(ac_climate) }}"
   direction: "{{ states(system_direction_helper) }}"
@@ -470,10 +496,11 @@ variables:
   # Минимальная пауза компрессора перед новым пуском. Барьер фазы считается по
   # своей метке и поэтому не защищает железо: после ЧУЖОЙ остановки (внутренний
   # термостат блока, пульт, отскок облака) наша метка может быть часовой
-  # давности, и вход прошёл бы через секунды после реального останова. Порог
-  # намеренно короче полного интервала фазы: он защищает компрессор, а не
-  # рисует duty-цикл, поэтому чужой дребезг крадёт максимум эти минуты.
-  min_off_seconds: "{{ [min_cycle_seconds, 180] | min }}"
+  # давности, и вход прошёл бы через секунды после реального останова. Это
+  # отдельный вход, а не доля от интервала фазы: величины отвечают на разные
+  # вопросы, и связывать их значило бы менять защиту железа при настройке
+  # duty-цикла.
+  min_off_seconds: "{{ (min_compressor_pause_minutes | float(3)) * 60 }}"
   seconds_since_mode_change_helper: >-
     {{ (now().timestamp() - (state_attr(last_mode_change_helper, 'timestamp') | default(0, true))) }}
   seconds_since_entity_change: "{{ (now() - states[ac_climate].last_changed).total_seconds() }}"
@@ -484,8 +511,16 @@ variables:
   # входа заново, и при duty=1 блок стоял выключенным часами (комната 24.7
   # при цели 24). У арбитра тот же приём законен — там min() защищает его
   # СОБСТВЕННЫЙ выход, который никто, кроме человека, не пишет.
+  # Метка стала несущей, поэтому проверяем, что это вообще эпоха. У time-only
+  # input_datetime timestamp — секунды от полуночи, у date-only — полночь; в
+  # обоих случаях отсчёт получился бы огромным и постоянным, то есть все
+  # барьеры фазы были бы всегда открыты и блок дребезжал бы. Тот же результат
+  # даёт неудачная запись метки. Раньше это маскировал min() с last_changed —
+  # теперь маскировать нечем, поэтому откатываемся на прежнюю семантику явно.
+  mode_mark_valid: >-
+    {{ (state_attr(last_mode_change_helper, 'timestamp') | float(0)) > 1000000000 }}
   seconds_since_mode_change: >-
-    {{ seconds_since_mode_change_helper }}
+    {{ seconds_since_mode_change_helper if mode_mark_valid else seconds_since_entity_change }}
   # Часы компрессора — там, где смысл в защите железа от частых пусков:
   # физический пуск состоялся, даже если его инициировали не мы.
   seconds_since_compressor_change: >-
@@ -826,12 +861,22 @@ actions:
               ac_internal: "{{ state_attr(ac_climate, 'current_temperature') | float(0) }}"
               offset: "{{ ac_internal - t }}"
               raw_setpoint: "{{ target + offset }}"
-              work_still_needed: "{{ (t < target) if is_heat else (t > target) }}"
+              work_still_needed: "{{ (predicted_t < target) if is_heat else (predicted_t > target) }}"
               runnable_setpoint: >-
                 {% if not work_still_needed %}{{ raw_setpoint
                 }}{% elif is_heat %}{{ [raw_setpoint, ac_internal + setpoint_margin] | max
                 }}{% else %}{{ [raw_setpoint, ac_internal - setpoint_margin] | min }}{% endif %}
-              desired_setpoint: "{{ [[runnable_setpoint, 16] | max, 30] | min | round(0) }}"
+              bounded_setpoint: "{{ [[runnable_setpoint | float(0), 16] | max, 30] | min }}"
+              # Округляем ПРОЧЬ от показаний датчика блока, пока работа нужна.
+              # round() тянет половину вверх, поэтому при зазоре 0.5 и целом
+              # показании (21.0 → 20.5 → 21) уставка возвращалась ровно к
+              # показаниям, блок снова глушил себя своим термостатом, и зазор
+              # не выполнял единственную свою задачу. Когда работа не нужна,
+              # обычное округление — там уставка наоборот должна быть выше.
+              desired_setpoint: >-
+                {% if not work_still_needed %}{{ bounded_setpoint | round(0)
+                }}{% elif is_heat %}{{ bounded_setpoint | round(0, 'ceil')
+                }}{% else %}{{ bounded_setpoint | round(0, 'floor') }}{% endif %}
               current_setpoint: "{{ state_attr(ac_climate, 'temperature') | float(0) }}"
           - condition: template
             alias: "Отправляем только при изменении не меньше гистерезиса коррекции уставки"
