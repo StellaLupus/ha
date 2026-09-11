@@ -1,6 +1,34 @@
 blueprint:
   name: "Кондиционер: климат-контроль (duty-cycle + антиовершут + обогрев)"
   description: >
+    v3.2: лечение трёх дефектов, из-за которых блок простаивал при перегретой
+    комнате, а контур пинг-понговал между направлениями.
+
+    (1) Часы фазы duty-цикла считаются ТОЛЬКО по собственной метке. Раньше
+    отсчёт брался как min(метка, last_changed climate-сущности), а её двигает
+    кто угодно: внутренний термостат блока, отскок облака, пульт, флап
+    unavailable. Каждое такое событие взводило барьер минимального интервала
+    заново, и при duty = 1.0 блок стоял выключенным (наблюдалось: комната 24.7
+    при цели 24, все условия входа в cool истинны кроме барьера). Отдельная
+    величина seconds_since_compressor_change сохраняет старую семантику и
+    используется там, где смысл именно в защите железа от частых пусков.
+
+    (2) Осушение получило температурный предохранитель. dry на этом железе —
+    работа компрессора на холод, но без цели и без выхода по температуре:
+    как off-фаза duty-цикла оно уводило комнату на 1.5-3 °C ниже цели,
+    пробивало порог входа в обогрев и разворачивало весь контур. Выход из dry
+    по температуре не ждёт минимального интервала — иначе барьер дорисовывает
+    ещё градус увода вниз.
+
+    (3) Поправка уставки ограничена по модулю. Встроенный датчик кондиционера
+    меряет обратный воздух/теплообменник: в работе он уезжает на 5-10 °C вниз
+    (наблюдалось 14 °C при комнатных 22.9), и формула уставка = цель + offset
+    загоняла уставку в минимум — блок работал в пол и проносил комнату мимо
+    цели. Плюс режим перечитывается нативным condition непосредственно перед
+    отправкой уставки: current_mode снят на старте прогона, а первый блок
+    действий мог за эти миллисекунды погасить блок, и команда терялась,
+    впустую сжигая интервал троттлинга.
+
     v3.1: у комнаты одна целевая температура на оба направления, а порог
     входа в обогрев — отдельная величина, только условие входа. Раньше
     обогрев вёл комнату к своей цели, совпадавшей с порогом: нагрев
@@ -344,6 +372,30 @@ blueprint:
           default: 10
           selector:
             number: { min: 3, max: 60, unit_of_measurement: "мин", mode: box }
+        max_setpoint_offset:
+          name: Максимальная поправка уставки
+          description: >
+            Градусы. Ограничивает offset-трюк по модулю. Встроенный датчик
+            кондиционера меряет обратный воздух/теплообменник, а не комнату:
+            в работе он уезжает на 5-10 °C вниз, и некомпенсированная формула
+            (уставка = цель + offset) загоняет уставку в минимум, после чего
+            блок работает в пол и проносит комнату далеко мимо цели. Реальная
+            погрешность датчика — единицы градусов; всё, что больше, это не
+            погрешность, а режим работы.
+          default: 2.5
+          selector:
+            number: { min: 0.5, max: 10, step: 0.5, unit_of_measurement: "°C", mode: box }
+        dry_undershoot_allowance:
+          name: Допустимый увод вниз при осушении
+          description: >
+            Градусы ниже целевой температуры, до которых разрешено осушение.
+            Осушение на этом железе — работа компрессора на холод, но без
+            цели и без выхода по температуре: как off-фаза duty-цикла оно
+            морозит комнату сколько угодно. Ниже (цель − это значение)
+            осушение гасится.
+          default: 0.5
+          selector:
+            number: { min: 0, max: 3, step: 0.1, unit_of_measurement: "°C", mode: box }
 
 variables:
   ac_climate: !input ac_climate
@@ -370,6 +422,8 @@ variables:
   window_minutes: !input window_minutes
   setpoint_correction_interval_minutes: !input setpoint_correction_interval_minutes
   sensor_staleness_minutes: !input sensor_staleness_minutes
+  max_setpoint_offset: !input max_setpoint_offset
+  dry_undershoot_allowance: !input dry_undershoot_allowance
   current_mode: "{{ states(ac_climate) }}"
   direction: "{{ states(system_direction_helper) }}"
   is_cool: "{{ direction == direction_cool_label }}"
@@ -395,10 +449,28 @@ variables:
   window_seconds: "{{ (window_minutes | float(15)) * 60 }}"
   on_duration: "{{ duty * window_seconds }}"
   min_cycle_seconds: "{{ (states(min_interval_helper) | float(5)) * 60 }}"
+  # Минимальная пауза компрессора перед новым пуском. Барьер фазы считается по
+  # своей метке и поэтому не защищает железо: после ЧУЖОЙ остановки (внутренний
+  # термостат блока, пульт, отскок облака) наша метка может быть часовой
+  # давности, и вход прошёл бы через секунды после реального останова. Порог
+  # намеренно короче полного интервала фазы: он защищает компрессор, а не
+  # рисует duty-цикл, поэтому чужой дребезг крадёт максимум эти минуты.
+  min_off_seconds: "{{ [min_cycle_seconds, 180] | min }}"
   seconds_since_mode_change_helper: >-
     {{ (now().timestamp() - (state_attr(last_mode_change_helper, 'timestamp') | default(0, true))) }}
   seconds_since_entity_change: "{{ (now() - states[ac_climate].last_changed).total_seconds() }}"
+  # Часы фазы duty-цикла — ТОЛЬКО собственная метка. Climate-сущность это
+  # зеркало облака, и её last_changed двигает кто угодно: сам блок по своему
+  # внутреннему термостату, отскок облака, пульт, флап unavailable. Пока
+  # отсчёт брался как min() с ней, каждое такое событие взводило барьер
+  # входа заново, и при duty=1 блок стоял выключенным часами (комната 24.7
+  # при цели 24). У арбитра тот же приём законен — там min() защищает его
+  # СОБСТВЕННЫЙ выход, который никто, кроме человека, не пишет.
   seconds_since_mode_change: >-
+    {{ seconds_since_mode_change_helper }}
+  # Часы компрессора — там, где смысл в защите железа от частых пусков:
+  # физический пуск состоялся, даже если его инициировали не мы.
+  seconds_since_compressor_change: >-
     {{ [seconds_since_mode_change_helper, seconds_since_entity_change] | min }}
   seconds_since_direction_change: >-
     {{ (now() - states[system_direction_helper].last_changed).total_seconds() }}
@@ -414,8 +486,25 @@ variables:
     {{ (now().timestamp() - (state_attr(last_setpoint_correction_helper, 'timestamp') | default(0, true))) }}
   sensor_stale: >-
     {{ (now().timestamp() - as_timestamp(states[ac_climate].last_updated)) > (sensor_staleness_minutes | float(10)) * 60 }}
+  # Осушение — работа компрессора на холод, но без цели и без выхода по
+  # температуре: единственный выход из dry это влажность. Как off-фаза
+  # duty-цикла оно уводило комнату на 1.5-3 °C ниже цели, пробивало порог
+  # входа в обогрев и разворачивало весь контур. Допуск вниз задаётся явно.
+  dry_floor: "{{ target - dry_undershoot_allowance }}"
+  dry_allowed_by_temp: "{{ predicted_t > dry_floor }}"
+  humidity_wants_dry: >-
+    {{ humidity_valid and (h >= hmax + hh or (current_mode == 'dry' and h > hmax - hh)) }}
   offphase_mode: >-
-    {% if is_cool and humidity_valid and (h >= hmax + hh or (current_mode == 'dry' and h > hmax - hh)) %}dry{% else %}off{% endif %}
+    {% if is_cool and humidity_wants_dry and dry_allowed_by_temp %}dry{% else %}off{% endif %}
+  # Осушку, ушедшую ниже допуска, гасим немедленно, не дожидаясь мин. интервала:
+  # иначе допуск в полградуса превращается в полтора градуса, пока барьер
+  # досчитывает. Условие намеренно НЕ требует, чтобы влажность всё ещё хотела
+  # осушки: нормальное завершение цикла — это как раз совпадение обеих причин
+  # остановки, и при такой связке блок продолжал бы морозить уже ниже допуска.
+  # Гашение по одной лишь влажности барьер по-прежнему ждёт — там датчик шумит
+  # на пороге и без барьера блок задребезжит.
+  dry_blocked_by_temp: >-
+    {{ current_mode == 'dry' and is_cool and not dry_allowed_by_temp }}
   forbidden_modes: >-
     {{ ['cool', 'dry', 'auto'] if is_heat else (['heat', 'auto'] if is_cool else ['cool', 'dry', 'heat', 'auto']) }}
   opposite_modes: >-
@@ -537,7 +626,10 @@ actions:
             condition: template
             value_template: "{{ duty >= 0.98 or forced_offphase or seconds_since_mode_change >= (window_seconds - on_duration) }}"
           - condition: template
-            value_template: "{{ seconds_since_mode_change >= min_cycle_seconds }}"
+            alias: "Два независимых барьера: длина фазы duty-цикла считается по своей метке (чужое событие не должно запирать вход), а пауза компрессора — по факту последней смены состояния блока, кем бы она ни была вызвана"
+            value_template: >-
+              {{ seconds_since_mode_change >= min_cycle_seconds
+                 and seconds_since_compressor_change >= min_off_seconds }}
         sequence:
           - action: climate.set_hvac_mode
             target:
@@ -564,9 +656,12 @@ actions:
             value_template: "{{ duty < 0.98 }}"
           - condition: template
             value_template: "{{ seconds_since_mode_change >= on_duration }}"
-          - alias: "Барьер асимметричный, но не бесплатный: цель достигнута (duty упал в ноль) — гасим сразу, иначе блок доводит комнату за цель ровно на длину барьера. Если же цель ещё не достигнута, а duty просто просел (скакнула производная), держим минимальное время работы: on_duration пересчитывается каждый прогон, и без этого пола компрессор ловил бы пуски по 20-60 секунд"
+          - alias: "Барьер асимметричный, но не бесплатный: цель достигнута (duty упал в ноль) — гасим сразу, иначе блок доводит комнату за цель ровно на длину барьера. Если же цель ещё не достигнута, а duty просто просел (скакнула производная), держим минимальное время работы: on_duration пересчитывается каждый прогон, и без этого пола компрессор ловил бы пуски по 20-60 секунд. Третья ветка — потолок: пол считается по часам компрессора, а их взводит и чужое событие, поэтому при среднем duty дребезг облака откладывал бы выход раз за разом и давал тот самый перелёт мимо цели. Фаза не живёт дольше своего окна ни при каких условиях"
             condition: template
-            value_template: "{{ at_target or seconds_since_mode_change >= min_cycle_seconds }}"
+            value_template: >-
+              {{ at_target
+                 or seconds_since_compressor_change >= min_cycle_seconds
+                 or seconds_since_mode_change >= window_seconds }}
         sequence:
           - action: climate.set_hvac_mode
             target:
@@ -601,7 +696,10 @@ actions:
             condition: template
             value_template: "{{ duty >= 0.98 or forced_offphase or seconds_since_mode_change >= (window_seconds - on_duration) }}"
           - condition: template
-            value_template: "{{ seconds_since_mode_change >= min_cycle_seconds }}"
+            alias: "Два независимых барьера: длина фазы duty-цикла считается по своей метке (чужое событие не должно запирать вход), а пауза компрессора — по факту последней смены состояния блока, кем бы она ни была вызвана"
+            value_template: >-
+              {{ seconds_since_mode_change >= min_cycle_seconds
+                 and seconds_since_compressor_change >= min_off_seconds }}
         sequence:
           - action: climate.set_hvac_mode
             target:
@@ -628,9 +726,12 @@ actions:
             value_template: "{{ duty < 0.98 }}"
           - condition: template
             value_template: "{{ seconds_since_mode_change >= on_duration }}"
-          - alias: "Барьер асимметричный, но не бесплатный: цель достигнута (duty упал в ноль) — гасим сразу, иначе блок доводит комнату за цель ровно на длину барьера. Если же цель ещё не достигнута, а duty просто просел (скакнула производная), держим минимальное время работы: on_duration пересчитывается каждый прогон, и без этого пола компрессор ловил бы пуски по 20-60 секунд"
+          - alias: "Барьер асимметричный, но не бесплатный: цель достигнута (duty упал в ноль) — гасим сразу, иначе блок доводит комнату за цель ровно на длину барьера. Если же цель ещё не достигнута, а duty просто просел (скакнула производная), держим минимальное время работы: on_duration пересчитывается каждый прогон, и без этого пола компрессор ловил бы пуски по 20-60 секунд. Третья ветка — потолок: пол считается по часам компрессора, а их взводит и чужое событие, поэтому при среднем duty дребезг облака откладывал бы выход раз за разом и давал тот самый перелёт мимо цели. Фаза не живёт дольше своего окна ни при каких условиях"
             condition: template
-            value_template: "{{ at_target or seconds_since_mode_change >= min_cycle_seconds }}"
+            value_template: >-
+              {{ at_target
+                 or seconds_since_compressor_change >= min_cycle_seconds
+                 or seconds_since_mode_change >= window_seconds }}
         sequence:
           - action: climate.set_hvac_mode
             target:
@@ -658,8 +759,10 @@ actions:
             value_template: "{{ not (current_mode == 'fan_only' and offphase_mode == 'off') }}"
           - condition: template
             value_template: "{{ offphase_mode != current_mode }}"
-          - condition: template
-            value_template: "{{ seconds_since_mode_change >= min_cycle_seconds }}"
+          - alias: "Барьер держит вход в осушку и выход из неё по влажности, но не выход по температуре: ниже допуска гасим сразу, иначе барьер дорисовывает ещё градус увода вниз"
+            condition: template
+            value_template: >-
+              {{ dry_blocked_by_temp or seconds_since_compressor_change >= min_cycle_seconds }}
         sequence:
           - action: climate.set_hvac_mode
             target:
@@ -675,8 +778,10 @@ actions:
   - alias: "Коррекция уставки под реальную температуру (троттлинг + защита от устаревшего встроенного датчика)"
     choose:
       - conditions:
-          - condition: template
-            value_template: "{{ current_mode in ['cool', 'dry', 'heat'] }}"
+          - alias: "Режим перечитываем движком, а не берём из current_mode: тот снят на старте прогона, а первый блок действий мог за эти миллисекунды погасить блок — и уставка улетала бы в выключенный кондиционер, впустую сжигая интервал троттлинга"
+            condition: state
+            entity_id: !input ac_climate
+            state: ["cool", "dry", "heat"]
           - condition: template
             value_template: "{{ not sensor_stale }}"
           - condition: template
@@ -691,7 +796,9 @@ actions:
             above: 0
         sequence:
           - variables:
-              offset: "{{ state_attr(ac_climate, 'current_temperature') | float(0) - t }}"
+              raw_offset: "{{ state_attr(ac_climate, 'current_temperature') | float(0) - t }}"
+              offset: >-
+                {{ [[raw_offset, -max_setpoint_offset] | max, max_setpoint_offset] | min }}
               raw_setpoint: "{{ target + offset }}"
               desired_setpoint: "{{ [[raw_setpoint, 16] | max, 30] | min | round(0) }}"
               current_setpoint: "{{ state_attr(ac_climate, 'temperature') | float(0) }}"
@@ -700,6 +807,10 @@ actions:
             value_template: "{{ (desired_setpoint - current_setpoint) | abs >= setpoint_th }}"
           - delay:
               seconds: "{{ mode_switch_delay }}"
+          - alias: "После паузы режим мог смениться (в т.ч. отскоком облака) — перечитываем ещё раз, уставка в выключенный блок теряется"
+            condition: state
+            entity_id: !input ac_climate
+            state: ["cool", "dry", "heat"]
           - action: climate.set_temperature
             target:
               entity_id: !input ac_climate
