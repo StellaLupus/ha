@@ -20,11 +20,17 @@ blueprint:
     по температуре не ждёт минимального интервала — иначе барьер дорисовывает
     ещё градус увода вниз.
 
-    (3) Поправка уставки ограничена по модулю. Встроенный датчик кондиционера
-    меряет обратный воздух/теплообменник: в работе он уезжает на 5-10 °C вниз
-    (наблюдалось 14 °C при комнатных 22.9), и формула уставка = цель + offset
-    загоняла уставку в минимум — блок работал в пол и проносил комнату мимо
-    цели. Плюс режим перечитывается нативным condition непосредственно перед
+    (3) Уставке гарантируется направление, а не величина: она обязана
+    оставаться ниже показаний встроенного датчика блока на заданный зазор
+    (в обогреве — выше). Смысл offset-трюка в том, чтобы блок РАБОТАЛ, а
+    останавливает его duty-цикл. Промежуточная версия ограничивала поправку
+    по модулю и этим ломала сам механизм: встроенный датчик меряет обратный
+    воздух и в работе читает на 3-9 °C ниже комнаты, поэтому обрезанная
+    поправка давала уставку ВЫШЕ его показаний, блок глушил компрессор своим
+    термостатом, HA видел cool, а комната грелась (38 минут в cool, уставка
+    22 при датчике 21, комната 24.3 → 24.9). Переохлаждение, из-за которого
+    клэмп вводился, лечится не здесь, а часами фазы из пункта (1).
+    Плюс режим перечитывается нативным condition непосредственно перед
     отправкой уставки: current_mode снят на старте прогона, а первый блок
     действий мог за эти миллисекунды погасить блок, и команда терялась,
     впустую сжигая интервал троттлинга.
@@ -372,19 +378,27 @@ blueprint:
           default: 10
           selector:
             number: { min: 3, max: 60, unit_of_measurement: "мин", mode: box }
-        max_setpoint_offset:
-          name: Максимальная поправка уставки
+        setpoint_margin:
+          name: Зазор уставки от датчика блока
           description: >
-            Градусы. Ограничивает offset-трюк по модулю. Встроенный датчик
-            кондиционера меряет обратный воздух/теплообменник, а не комнату:
-            в работе он уезжает на 5-10 °C вниз, и некомпенсированная формула
-            (уставка = цель + offset) загоняет уставку в минимум, после чего
-            блок работает в пол и проносит комнату далеко мимо цели. Реальная
-            погрешность датчика — единицы градусов; всё, что больше, это не
-            погрешность, а режим работы.
-          default: 2.5
+            Градусы. Уставка обязана оставаться НИЖЕ показаний встроенного
+            датчика кондиционера на эту величину в охлаждении (и выше — в
+            обогреве), иначе собственный термостат блока решит, что делать
+            нечего, и заглушит компрессор: HA будет видеть режим cool, а
+            комната — греться.
+
+            Именно это ломала попытка ограничить поправку по модулю:
+            встроенный датчик меряет обратный воздух и в работе читает на
+            3-9 °C ниже комнаты, поэтому обрезанная поправка давала уставку
+            ВЫШЕ его показаний. Наблюдалось: 38 минут в cool, уставка 22 при
+            датчике блока 21, комната за это время выросла с 24.3 до 24.9.
+
+            Смысл offset-трюка — заставить блок работать; останавливает его
+            duty-цикл, а не внутренний термостат. Поэтому величина поправки
+            не ограничивается, гарантируется только её направление.
+          default: 1
           selector:
-            number: { min: 0.5, max: 10, step: 0.5, unit_of_measurement: "°C", mode: box }
+            number: { min: 0.5, max: 5, step: 0.5, unit_of_measurement: "°C", mode: box }
         dry_undershoot_allowance:
           name: Допустимый увод вниз при осушении
           description: >
@@ -422,7 +436,7 @@ variables:
   window_minutes: !input window_minutes
   setpoint_correction_interval_minutes: !input setpoint_correction_interval_minutes
   sensor_staleness_minutes: !input sensor_staleness_minutes
-  max_setpoint_offset: !input max_setpoint_offset
+  setpoint_margin: !input setpoint_margin
   dry_undershoot_allowance: !input dry_undershoot_allowance
   current_mode: "{{ states(ac_climate) }}"
   direction: "{{ states(system_direction_helper) }}"
@@ -796,11 +810,13 @@ actions:
             above: 0
         sequence:
           - variables:
-              raw_offset: "{{ state_attr(ac_climate, 'current_temperature') | float(0) - t }}"
-              offset: >-
-                {{ [[raw_offset, -max_setpoint_offset] | max, max_setpoint_offset] | min }}
+              ac_internal: "{{ state_attr(ac_climate, 'current_temperature') | float(0) }}"
+              offset: "{{ ac_internal - t }}"
               raw_setpoint: "{{ target + offset }}"
-              desired_setpoint: "{{ [[raw_setpoint, 16] | max, 30] | min | round(0) }}"
+              runnable_setpoint: >-
+                {% if is_heat %}{{ [raw_setpoint, ac_internal + setpoint_margin] | max
+                }}{% else %}{{ [raw_setpoint, ac_internal - setpoint_margin] | min }}{% endif %}
+              desired_setpoint: "{{ [[runnable_setpoint, 16] | max, 30] | min | round(0) }}"
               current_setpoint: "{{ state_attr(ac_climate, 'temperature') | float(0) }}"
           - condition: template
             alias: "Отправляем только при изменении не меньше гистерезиса коррекции уставки"
